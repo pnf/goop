@@ -1,7 +1,11 @@
 (ns goop.core
+  (:use clojure.walk clojure.pprint)
   (:require [ clojure.core.async :as async :refer [<! >! <!! timeout chan alt!! go close!]]
             [clojure.core.async.impl.protocols :as pimpl]
-            [clojure.test :refer [function?]])
+            [clojure.test :refer [function?]]
+            [clojure.core.match :refer [match]]
+            [clojure.string :as st]
+            )
 )
 
 
@@ -16,33 +20,79 @@ Would be nice to detect that nobody was listening anymore."
     c
     ))
 
-;; Ideally, a goop can be used as-is in normal code and return a value, but can be detected
-;; in a goop context.
-;; (goop foo [a] (+ a 1))
-;; (goop bar [b] (+ b 2))
-;; (let [f (foo 3)
-;;       g (bar (foo 3))]
-;; How could that work?  Well, bar could be a macro?
+(defn build-go-let [forms bs]
+  (cond (seq bs)
+        `(go (let [~@bs] ~@forms))
+        (> (count forms) 1)
+        `(go (do ~@forms))
+        :else
+        `(go ~@forms)))
 
-(comment
-  (goop (foo a b ch (bar b) (zap z))) ; =>
-  (let [b$1 (goop (bar b))
-        z$1 (goop (zap z))]
-    (go (foo a b (<! ch) (<! b$1) (<! b$2))))
+(defn parallelize [form s2c arghint] ;; => {:form form :s2c s2c :c c :cdef cdef}
+  ;(println "Parallelizing" form s2c)
+  (cond (and (list? form) (function? (first form)))
+        (let [f  (first form)
+              ch (gensym arghint)
+              ps (map #(parallelize % s2c "ch-") (rest form))
+              bs (mapcat :cdef ps)
+              args (map :form ps)]
+          {:form `(<! ~ch)
+           :s2c s2c
+           :c ch
+           :cdef  [ch (build-go-let [`(~f ~@args)] bs)]})
+        (and (list? form) (= 'let (first form)))
+        (let [bs (second form)
+              forms (nthrest form 2)
+              ch (gensym arghint)
+              {s2c :s2c bs  :bs}  (reduce (fn [{s2c :s2c  bs :bs} [a v]]
+                                            (println "s2c:" s2c "bs:" bs "a:" a "v:" v)
+                                            (let [{form :form s2c :s2c cdef :cdef c :c} (parallelize v s2c a)]
+                                              (println "parallelized form:" form "s2c:" s2c :cdef cdef  "c:" c)
+                                              (if cdef
+                                                {:s2c (assoc s2c a c) :bs (concat bs cdef)}
+                                                {:s2c s2c :bs (concat bs [a v])})))
+                                          {:s2c s2c :bs []}
+                                          (partition 2 bs))
+              ps (map #(parallelize % s2c "form-") forms)
+              bs (apply concat bs (map :cdef ps))
+              forms (map :form ps)
+              _           (println "After reduction" s2c bs forms)]
 
-  )
+          {:form `(<! ~ch)
+           :s2c s2c
+           :c ch
+           :cdef [ch (build-go-let forms bs)]})
+        :else
+        (do
+          ;(println "Default" s2c form)
+          {:form (if-let [ch (get s2c form)] `(<! ~ch) form)
+           :s2c s2c})))
 
 (defmacro goop [form]
-  (if (and (list? form) (symbol? (first form)))
-    (let [n    (dec (count form))
-          fun  (first form)
-          syms (repeatedly n #(gensym "c"))
-          chs  (map (fn [c] `(goop ~c)) (rest form))
-          bdgs (interleave syms chs)
-          vals (map (fn [x] `(<! ~x)) syms)]
-      `(go (let [~@bdgs] (fun ~@vals))))
-      `(go ~form)
-)  )
+  (let [{form :form cdef :cdef} (parallelize form {} "goop-")
+        res (build-go-let [form] cdef)]
+    (pprint res)
+    res
+    ))
+
+
+
+
+;; (comment
+
+;;     (symbol? form)
+;;     (or (get ch-bindings form) form)
+
+;;     (= hd 'let) ;; parallelize bindings
+;;             (let [[bdgs & body] args
+;;                   [syms vals] (apply mapv vector (partition 2 bdgs))
+;;                   ch-syms (repeatedly (count syms) #(gensym "c"))
+;;                   ch-bindings (apply assoc ch-bindings (interleave syms ch-syms))
+;;                   goops   (map (fn [a] `(goop ~a ch-bindings)) vals)
+;;                   bdgs  (vec  (interleave ch-syms goops))]
+;;               `(let ~bdgs (goop ~body)))
+
+;;   )
 
 
 
