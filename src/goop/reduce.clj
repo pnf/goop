@@ -48,38 +48,28 @@
 
 (defn assoc-reduce2 [f c-in & [np-max]]
   (let [c-result (promise-chan)
-        c-red    (chan (or np-max 10))]
-
-    ;; Launch a reduction of result a at level l if a peer is available; otherwise set as peer.
-    (defn with-reduction [a l {:keys [front-id next-id peers np] :as state}]
-      (if-let [p (peers l)]
-        (do (go (<! (timeout (rand-int 10))) (>! c-red [next-id (f p a) (inc l)]))
-            (assoc state :next-id (inc next-id) :peers (dissoc peers l) :np (inc np)))
-        (assoc state :peers (assoc peers l a))))
-    
-    (async/go-loop [{:keys [c-in front-id results next-id peers np] :as state}
-                    {:c-in c-in :front-id 0 :next-id 0 :np 0 :results (hash-map) :peers (hash-map)}]
-      (prn state)
-      ;; Result ready at front?
-      (if-let [[a l] (results front-id)]
-        ;; Reduce with appropriate peer
-        (recur  (with-reduction a l (assoc state :results (dissoc results front-id) :front-id (inc front-id))))
-        ;; No result.  Any pending reductions or inputs?
-        (if-let [cs (seq (filter identity (list (if (pos? np) c-red) c-in)))]
-          (let [[v c] (alts! cs)]
-            (condp = c
-              c-red (let [[i a l] v]
-                      (recur (assoc state :results (assoc results i [a l]) :np (dec np))))
-              c-in  (if v
-                      (recur (with-reduction v 0 state))
-                      (recur (assoc state :c-in nil)))))
-          (if (pos? (count (dissoc peers 0)))
-            (recur {:c-in-live true
-                    :c-in (spool (reverse (map peers (sort (keys peers)))))
-                    :front-id 0 :next-id 0
-                    :results (hash-map) :peers (hash-map)
-                    :np 0})
-            (>! c-result (peers 0)))))) ;; otherwise return final result
+        c-redn    (chan (or np-max 10))]
+    (let [with-reduction (fn [a l {:keys [front-id next-id peers np] :as state}]
+                           (if-let [p (peers l)]
+                             (do (go  (>! c-redn [next-id (<! (f p a)) (inc l)]))
+                                 (assoc state :next-id (inc next-id) :peers (dissoc peers l) :np (inc np)))
+                             (assoc state :peers (assoc peers l a))))
+          default-state   {:c-in c-in :front-id 0 :next-id 0 :np 0 :results (hash-map) :peers (hash-map)}]
+      (async/go-loop [{:keys [c-in front-id results next-id peers np] :as state} default-state]
+        (prn np (count peers))
+        (if-let [[a l] (results front-id)]  ;; If head result read, reduce with peer
+          (recur  (with-reduction a l (assoc state :results (dissoc results front-id) :front-id (inc front-id))))
+          (if-let [cs (seq (filter identity (list (if (pos? np) c-redn) c-in)))]
+            (let [[v c] (alts! cs)] ;; Listen for reductions and/or inputs
+              (condp = c
+                c-redn (let [[i a l] v] ;; got a reduction
+                         (recur (assoc state :results (assoc results i [a l]) :np (dec np))))
+                c-in   (if v ;; got an input or and end-of-input
+                         (recur (with-reduction v 0 state))
+                         (recur (assoc state :c-in nil)))))
+            (if (pos? (count (dissoc peers 0)))
+              (recur (assoc default-state :c-in (spool (reverse (map peers (sort (keys peers)))))))
+              (>! c-result (peers 0))))))) ;; otherwise return final result
     c-result))
 
 (defn delay-spool [as t]
