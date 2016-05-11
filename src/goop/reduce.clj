@@ -46,9 +46,9 @@
     result))
 
 
-(defn assoc-reduce2 [f c-in & [np-max]]
+(defn assoc-reduce2 [f c-in & {:keys [np-max debug] :or {np-max 10 debug false}}]
   (let [c-result (promise-chan)
-        c-redn    (chan (or np-max 10))]
+        c-redn    (chan np-max)]
     (let [with-reduction (fn [a l {:keys [front-id next-id peers np] :as state}]
                            (if-let [p (peers l)]
                              (do (go  (>! c-redn [next-id (<! (f p a)) (inc l)]))
@@ -56,7 +56,7 @@
                              (assoc state :peers (assoc peers l a))))
           default-state   {:c-in c-in :front-id 0 :next-id 0 :np 0 :results (hash-map) :peers (hash-map)}]
       (async/go-loop [{:keys [c-in front-id results next-id peers np] :as state} default-state]
-        (prn np (count peers))
+        (when debug  (prn (dissoc state :c-in)))
         (if-let [[a l] (results front-id)]  ;; If head result read, reduce with peer
           (recur  (with-reduction a l (assoc state :results (dissoc results front-id) :front-id (inc front-id))))
           (if-let [cs (seq (filter identity (list (if (pos? np) c-redn) c-in)))]
