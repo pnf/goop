@@ -96,33 +96,30 @@
     [np peers]))
 
 
+(defn launch-reductions [c-redn f l ps]
+  (let [pairs (take-while (fn [[a b]] (and a b))
+                          (partition 2 (map deref ps)))]
+    (map (fn [[a b]]
+           (let [v (volatile! nil)]
+             (go (>! c-redn [(inc l) (<! (f a b)) v]))
+             v)) pairs)))
+
+(defn wrapv [c] (pipe c (chan 1 (map (fn [x] [0 x nil])))))
+
 
 (defn assoc-reduce3 [f c-in & {:keys [np-max debug] :or {np-max 10 debug false}}]
   (let [c-result (promise-chan)
-        c-redn    (chan np-max)
-        kill      (volatile! 1000)]
-    (async/go-loop [{:keys [c-in peers np] :as state} {:c-in c-in :peers {} :np 0}]
-      (if (zero? (vswap! kill dec)) (throw (ex-info "bleh" {})))
+        c-redn    (chan np-max)]
+    (async/go-loop [{:keys [c-in peers np] :as state} {:c-in (wrapv c-in) :peers {} :np 0}]
       (if debug (prn (pretty-state state)))
       (if-let [cs (seq (filter identity (list (if (pos? np) c-redn) c-in)))]
-        (let [[v  c]    (alts! cs)]
-          ;(prn "Got" v)
-          (if-not v
+        (let [[[l res v]  c]  (alts! cs)]
+          (if-not l
             (recur (assoc state :c-in nil))
-            (let [[l ps]    (if (= c c-redn)
-                              (let [[l res w] v]
-                                (vreset! w res)
-                                [l (peers l)])
-                              (let [w  (volatile! v)
-                                    ps (concat (peers 0) [w])]
-                                [0 ps]))
-                  vs        (map (fn [[a b]]
-                                   (let [v (volatile! nil)]
-                                     ;(prn "Reducing" a b)
-                                     (go (>! c-redn [(inc l) (<! (f a b)) v]))
-                                     v))
-                                 (take-while (fn [[a b]] (and a b))
-                                             (partition 2 (map deref ps))))
+            (let [ps        (if v
+                              (do (vreset! v res) (peers l))
+                              (concat (peers 0) [(volatile! res)]))
+                  vs        (launch-reductions c-redn f l ps)
                   ps        (drop (* (count vs) 2) ps )
                   np        (cond-> (+ np (count vs)) (pos? l) dec)
                   l2        (inc l)
@@ -139,5 +136,5 @@
           (if debug (prn "Reducing reductions" reds))
           (if (<= (count reds) 1)
             (>! c-result (first reds))
-            (recur {:c-in (spool reds) :peers {} :np 0})))))
+            (recur {:c-in (wrapv (spool reds)) :peers {} :np 0})))))
     c-result))
