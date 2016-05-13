@@ -1,9 +1,7 @@
 (ns goop.reduce
-  (:require [clojure.core.async :as async :refer [<! >! <!! timeout chan promise-chan alt! alts! go]]
+  (:require [clojure.core.async :as async :refer [<! >! <!! timeout chan promise-chan alt! alts! go pipe]]
             [clojure.core.async.lab :refer [spool]]
             ))
-
-
 
 
 (defn assoc-reduce [f coll & [npmax]]
@@ -46,6 +44,21 @@
     result))
 
 
+(defn delay-spool [as t]
+  (let [c (chan)]
+    (async/go-loop [[a & as] as]
+      (if a
+        (do a
+            (>! c a)
+            (<! (timeout (rand-int t)))
+            (recur as)
+            )
+        (async/close! c)))
+    c))
+
+
+
+
 (defn assoc-reduce2 [f c-in & {:keys [np-max debug] :or {np-max 10 debug false}}]
   (let [c-result (promise-chan)
         c-redn    (chan np-max)]
@@ -72,14 +85,59 @@
               (>! c-result (peers 0))))))) ;; otherwise return final result
     c-result))
 
-(defn delay-spool [as t]
-  (let [c (chan)]
-    (async/go-loop [[a & as] as]
-      (if a
-        (do a
-            (>! c a)
-            (<! (timeout (rand-int t)))
-            (recur as)
-            )
-        (async/close! c)))
-    c))
+
+(defn pretty-state [{:keys [peers np]}]
+  (let [peers (->> (seq peers)
+                   (sort-by first)
+                   (filter second)
+                   (map (fn [[l ps]]
+                          (let [psd  (map deref ps)]
+                            [l (take-while identity (take 2 psd)) (count psd) (count (filter not psd))]))))]
+    [np peers]))
+
+
+
+(defn assoc-reduce3 [f c-in & {:keys [np-max debug] :or {np-max 10 debug false}}]
+  (let [c-result (promise-chan)
+        c-redn    (chan np-max)
+        kill      (volatile! 1000)]
+    (async/go-loop [{:keys [c-in peers np] :as state} {:c-in c-in :peers {} :np 0}]
+      (if (zero? (vswap! kill dec)) (throw (ex-info "bleh" {})))
+      (if debug (prn (pretty-state state)))
+      (if-let [cs (seq (filter identity (list (if (pos? np) c-redn) c-in)))]
+        (let [[v  c]    (alts! cs)]
+          ;(prn "Got" v)
+          (if-not v
+            (recur (assoc state :c-in nil))
+            (let [[l ps]    (if (= c c-redn)
+                              (let [[l res w] v]
+                                (vreset! w res)
+                                [l (peers l)])
+                              (let [w  (volatile! v)
+                                    ps (concat (peers 0) [w])]
+                                [0 ps]))
+                  vs        (map (fn [[a b]]
+                                   (let [v (volatile! nil)]
+                                     ;(prn "Reducing" a b)
+                                     (go (>! c-redn [(inc l) (<! (f a b)) v]))
+                                     v))
+                                 (take-while (fn [[a b]] (and a b))
+                                             (partition 2 (map deref ps))))
+                  ps        (drop (* (count vs) 2) ps )
+                  np        (cond-> (+ np (count vs)) (pos? l) dec)
+                  l2        (inc l)
+                  ps2       (concat (peers l2) vs)]
+              (recur (assoc state :np np :peers (assoc peers l ps l2 ps2))))))
+        (let [reds (->> (seq peers)
+                        (sort-by first)
+                        (map second)
+                        (map first)
+                        (filter identity)
+                        (map deref)
+                        reverse
+                        )]
+          (if debug (prn "Reducing reductions" reds))
+          (if (<= (count reds) 1)
+            (>! c-result (first reds))
+            (recur {:c-in (spool reds) :peers {} :np 0})))))
+    c-result))
