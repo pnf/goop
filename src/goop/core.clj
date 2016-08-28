@@ -1,28 +1,23 @@
 (ns goop.core
   (:use clojure.walk clojure.pprint)
   (:require [co.paralleluniverse.pulsar.async :as async :refer [<! >! <!! timeout chan  go close!]]
-            [clojure.core.async :as casync ;;:refer [<! >! <!! timeout chan promise-chan alt!! go close!]
-             ]
+            ;[clojure.core.async :as async :refer [<! >! <!! timeout chan promise-chan alt!! go close!]]
             [co.paralleluniverse.pulsar.core :as q]
-            [clojure.core.async.impl.protocols :as pimpl]
             [clojure.test :refer [function?]]
             [clojure.core.match :refer [match]]
             [clojure.string :as st]
             [goop.cache :refer (soft-cache-factory)]
-            )
-)
+            ))
 
 
-(defn promise-chan []
-  "Repeatedly delivers first value ever written to it.
-Would be nice to detect that nobody was listening anymore."
-  (let [c (chan)]
-    (go (let [v (<! c)]
-          (while (not (pimpl/closed? c))
-            (>! c v))
-          ))
-    c
-    ))
+(defn build-let [forms bs]
+  (cond (seq bs)
+        `(let [~@bs] ~@forms)
+        (> (count forms) 1)
+        `(do ~@forms)
+        :else
+        (first forms))
+  )
 
 (defn build-go-let
   ;; Wrap up a form with some optional bindings as a channel.
@@ -35,7 +30,7 @@ Would be nice to detect that nobody was listening anymore."
         `(go ~@forms)))
 
 (defn build-q-let
-  ;; Wrap up a form with some optional bindings as a channel.
+  ;; Wrap up a form with some optional bindings as a quasar promise.
   [forms bs]
   (cond (seq bs)             `(q/promise
                                #(let [~@bs]
@@ -44,89 +39,151 @@ Would be nice to detect that nobody was listening anymore."
         :else                `(q/promise (fn [] ~@forms))
         ))
 
+(defn goop-fn [f]
+  (some-> f (as-> s (and (symbol? s) (resolve s)))
+          var-get
+          meta
+          :goop
+          symbol
+          resolve))
+
 (defn goop-call? [form]
   (if (list? form)
     (some-> (first form) (as-> s (and (symbol? s) (resolve s)))
             var-get meta
-            :goop)))
+            :goop
+            symbol
+            resolve)))
 
-(defn parallelize [form s2c arghint] ;; => {:form form :s2c s2c :c c :cdef cdef}
+(declare parallelize parallelize-goop-call parallelize-function-call)
+(defn parallelize-goop-call [gf args sym->chan ch-prefix]
+  (let [ps   (map #(parallelize % sym->chan "ch-") args)
+        bs   (mapcat :ch-bind ps)
+        args (map :form ps)
+        ch   (gensym ch-prefix)
+        cdef (build-let [`(~gf ~@args)] bs)]
+    (println "parallelize-goop-call" gf args ps)
+    {:sym->chan sym->chan
+     :form `(<! ~ch)
+       :par true
+       :c ch
+       :cdef cdef
+       :ch-bind [ch cdef]}))
+
+
+(defn parallelize-function-call [f args sym->chan ch-prefix]
+  (println "parallelize-function-call" f args (type args))
+  (let [
+        ps   (map #(parallelize % sym->chan "ch-") args)
+        bs   (mapcat :ch-bind ps)
+        args (map :form ps)
+        par  (some :par ps)]
+    
+    (merge {:sym->chan sym->chan
+            :par par
+            :ch-bind []}
+           (if par ;; Invoking a regular function with par args
+             (let [ch   (gensym ch-prefix)
+                   cdef `(go ~(build-let [`(~f ~@args)] bs))]
+               {:form `(<! ~ch)
+                :par true
+                :c ch
+                :cdef cdef
+                :ch-bind [ch cdef]})
+             {:form (build-let [`(~f ~@args)] bs)}))))
+
+(defn parallelize-let [form sym->chan ch-prefix]
+(let [bs (second form)
+          forms (nthrest form 2)
+          ;; Parallelize rhs of each binding, accruing sym->chan map.
+          {sym->chan :sym->chan bs :bs}  (reduce (fn [{:keys [sym->chan bs]} [a v]]
+                                                   (let [{:keys [form sym->chan cdef ch-bind c]} (parallelize v sym->chan a)]
+                                                      (if cdef
+                                                        {:sym->chan (assoc sym->chan a c) :bs (concat bs ch-bind)}
+                                                        {:sym->chan sym->chan             :bs (concat bs [a v])})))
+                                                  {:sym->chan sym->chan :bs []}
+                                                  (partition 2 bs))
+          ;; Parallelize the forms
+          ps (map #(parallelize % sym->chan "form-") forms)
+          par (some :par ps)
+          ;; Augment bindings with channel definitions for each form
+          bs (apply concat bs (map :ch-bind ps))
+          forms (map :form ps)]
+      (merge {:sym->chan sym->chan
+              :par par}
+             (if par
+               (let [ch (gensym ch-prefix)
+                     cdef  `(go ~(build-let forms bs))]
+                 {:c ch
+                  :cdef cdef
+                  :ch-bind [ch cdef]
+                  :form `(<! ~ch)})
+               {:form (build-let forms bs)})))  )
+
+(defn parallelize
+  "Returns map
+    :form      Parallelized form that can be substituted.
+    :c         Symbol of channel that returns the contents of the form
+    :cdef      Binding that defines the channel
+    :sym->chan Map of user symbols to channel symbols"
+  [form sym->chan ch-prefix]
+  (println "parallelize" form (type form) (list? form))
+  (cond
+    (and (list? form) (function? (first form)))
+    (let [f   (first form)
+          gf (goop-fn f)]
+      (if gf
+        (parallelize-goop-call gf (rest form) sym->chan ch-prefix)
+        (parallelize-function-call f (rest form) sym->chan ch-prefix)))
+    (and (list? form) (= 'let (first form)))
+    (parallelize-let form sym->chan ch-prefix)
+    :else
+    {:form (if-let [ch (get sym->chan form)] `(<! ~ch) form)
+       :sym->chan sym->chan}))
+
+(defn qparallelize [form sym->chan ch-prefix] ;; => {:form form :sym->chan sym->chan :c c :ch-bind cdef}
   (cond
     ;; function call
     #_(goop-call? form)
     (and (list? form) (function? (first form)))
     (let [f  (first form)
-          ch (gensym arghint)
-          ps (map #(parallelize % s2c "ch-") (rest form))
-          bs (mapcat :cdef ps)
-          args (map :form ps)]
-      {:form `(<! ~ch)
-       :s2c s2c
+          ch (gensym ch-prefix)
+          ps (map #(qparallelize % sym->chan "ch-") (rest form))
+          bs (mapcat :ch-bind ps)
+          args (map :form ps)
+          cdef (build-q-let [`(~f ~@args)] bs)
+          ]
+      {:form `(deref ~ch)
+       :sym->chan sym->chan
        :c ch
-       :cdef  [ch (build-go-let [`(~f ~@args)] bs)]})
+       :cdef cdef
+       :ch-bind  [ch cdef]})
+
     ;; let form
     (and (list? form) (= 'let (first form)))
     (let [bs (second form)
           forms (nthrest form 2)
-          ch (gensym arghint)
-          {s2c :s2c bs  :bs}  (reduce (fn [{s2c :s2c  bs :bs} [a v]]
-                                        (let [{form :form s2c :s2c cdef :cdef c :c} (parallelize v s2c a)]
+          ch (gensym ch-prefix)
+          {sym->chan :sym->chan bs  :bs}  (reduce (fn [{sym->chan :sym->chan  bs :bs} [a v]]
+                                        (let [{form :form sym->chan :sym->chan cdef :ch-bind c :c} (qparallelize v sym->chan a)]
                                           (if cdef
-                                            {:s2c (assoc s2c a c) :bs (concat bs cdef)}
-                                            {:s2c s2c :bs (concat bs [a v])})))
-                                      {:s2c s2c :bs []}
+                                            {:sym->chan (assoc sym->chan a c) :bs (concat bs cdef)}
+                                            {:sym->chan sym->chan :bs (concat bs [a v])})))
+                                      {:sym->chan sym->chan :bs []}
                                       (partition 2 bs))
-          ps (map #(parallelize % s2c "form-") forms)
-          bs (apply concat bs (map :cdef ps))
-          forms (map :form ps)]
-
-      {:form `(<! ~ch)
-       :s2c s2c
+          ps (map #(qparallelize % sym->chan "form-") forms)
+          bs (apply concat bs (map :ch-bind ps))
+          forms (map :form ps)
+          cdef (build-q-let forms bs)]
+      {:form `(deref ~ch)
+       :sym->chan sym->chan
        :c ch
-       :cdef [ch (build-go-let forms bs)]})
+       :cdef cdef
+       :ch-bind [ch cdef]})
     :else
     (do
-      {:form (if-let [ch (get s2c form)] `(<! ~ch) form)
-       :s2c s2c})))
-
-(defn qparallelize [form s2c arghint] ;; => {:form form :s2c s2c :c c :cdef cdef}
-  (cond
-    ;; function call
-    #_(goop-call? form)
-    (and (list? form) (function? (first form)))
-    (let [f  (first form)
-          ch (gensym arghint)
-          ps (map #(parallelize % s2c "ch-") (rest form))
-          bs (mapcat :cdef ps)
-          args (map :form ps)]
-      {:form `(deref ~ch)
-       :s2c s2c
-       :c ch
-       :cdef  [ch (build-q-let [`(~f ~@args)] bs)]})
-    ;; let form
-    (and (list? form) (= 'let (first form)))
-    (let [bs (second form)
-          forms (nthrest form 2)
-          ch (gensym arghint)
-          {s2c :s2c bs  :bs}  (reduce (fn [{s2c :s2c  bs :bs} [a v]]
-                                        (let [{form :form s2c :s2c cdef :cdef c :c} (parallelize v s2c a)]
-                                          (if cdef
-                                            {:s2c (assoc s2c a c) :bs (concat bs cdef)}
-                                            {:s2c s2c :bs (concat bs [a v])})))
-                                      {:s2c s2c :bs []}
-                                      (partition 2 bs))
-          ps (map #(parallelize % s2c "form-") forms)
-          bs (apply concat bs (map :cdef ps))
-          forms (map :form ps)]
-
-      {:form `(deref ~ch)
-       :s2c s2c
-       :c ch
-       :cdef [ch (build-q-let forms bs)]})
-    :else
-    (do
-      {:form (if-let [ch (get s2c form)] `(deref ~ch) form)
-       :s2c s2c})))
+      {:form (if-let [ch (get sym->chan form)] `(deref ~ch) form)
+       :sym->chan sym->chan})))
 
 
 (comment
@@ -146,6 +203,14 @@ Would be nice to detect that nobody was listening anymore."
    (map deref (apply map (fn [x1 x2 & xs] (q/promise (fn [] (apply f x1 x2 xs)))) c1 c2 cs))) )
 
 
+(defmacro goop [form]
+  (let [{form :form cdef :cdef bs :ch-bind} (parallelize form {} "goop-")]
+    (println cdef)
+    (if cdef
+      `(let [~@bs] (<! ~cdef))
+      form)))
+
+
 (defmacro qoop [form]
   (let [{form :form cdef :cdef} (qparallelize form {} "qoop-")
         res (build-q-let [form] cdef)]
@@ -153,34 +218,48 @@ Would be nice to detect that nobody was listening anymore."
     res
     ))
 
-(defmacro goop [form]
-  (let [{form :form cdef :cdef} (parallelize form {} "goop-")
-        res (build-go-let [form] cdef)]
-    (pprint res)
-    res
-    ))
+
 
 (defmacro gn [args & forms]
   `(with-meta
      (fn ~args ~@forms)
      {:goop true}))
 
-(defmacro defgoop [fname args & forms]
-  `(def ~fname (with-meta
-                 (fn ~args ~@forms)
-                 {:goop true})))
+(defmacro defgoop [fname args form]
+  (let [gf (gensym (str fname "-goop-") )
+        gfs (name gf)
+        {form :form cdef :cdef} (parallelize form {} "goop-")
+        cdef (or cdef `(go ~form))]
+    `(do
+       (defn ~gf ~args ~cdef)
+       (def ~fname (with-meta
+                     (fn ~args (<! (~gf ~@args)))
+                     {:goop ~gfs})))))
 
 
 
 (def cache (soft-cache-factory {}))
 
+
+
 (comment
-"How should one handle stream operations?
+
+  "Currently parallelizing all arguments to all functions.
+Can we parallelize only forms that contain something goopy?
+
+"
+
+  "TODO
+
+
+"
+  
+
+
+  "How should one handle stream operations?
 Return channel containing results?
 Return channel returning channels?
 "
-
-
 
   
   (def get-promise [f args]
@@ -236,7 +315,4 @@ Otherwise returns value.
 ;;   listeners
 
 
-(defn foo
-  "I don't do a whole lot."
-  [x]
-  (println x "Hello, World!"))
+
