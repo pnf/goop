@@ -1,7 +1,7 @@
 (ns goop.core
   (:use clojure.walk clojure.pprint)
-  (:require [co.paralleluniverse.pulsar.async :as async :refer [<! >! <!! timeout chan  go close!]]
-            ;[clojure.core.async :as async :refer [<! >! <!! timeout chan promise-chan alt!! go close!]]
+  (:require [co.paralleluniverse.pulsar.async :as a]
+            [clojure.core.async]
             [co.paralleluniverse.pulsar.core :as q]
             [clojure.test :refer [function?]]
             [clojure.core.match :refer [match]]
@@ -9,9 +9,11 @@
             [goop.cache :refer (soft-cache-factory)]
             ))
 
-(defn- form-to-chan [form] `(go ~form))
+(defn- form-to-chan [form] `(a/go ~form))
 ;;(defn launch-form [form] `(q/promise (fn [] ~form)))
-(defn- await-chan [ch] `(<! ~ch))
+(defn- await-chan [ch] `(a/<! ~ch))
+(defmacro <! [ch] (await-chan ch))
+(defmacro go [form] (form-to-chan form))
 ;;(defn await-chan [ch] `(deref ~ch))
 
 
@@ -25,7 +27,45 @@
   )
 
 
-(defn goop-fn [f]
+(declare parallelize parallelize-goop-call parallelize-function-call)
+
+(defrecord GoopFn [gfn]
+  clojure.lang.IFn
+  (invoke [this x1] (<! (gfn x1)))
+  (invoke [this x1 x2] (<! (gfn x1 x2)))
+  (invoke [this x1 x2 x3] (<! (gfn x1 x2 x3)))
+  (invoke [this x1 x2 x3 x4] (<! (gfn x1 x2 x3 x4)))
+  (invoke [this x1 x2 x3 x4 x5] (<! (gfn x1 x2 x3 x4 x5)))
+  (applyTo [this args] (clojure.lang.AFn/applyToHelper this args)))
+
+(defmacro defgoop [fname args form]
+  (let [{form :form cdef :cdef} (parallelize form {} "goop-")
+        cdef (or cdef (form-to-chan form))
+        gfn `(fn ~args ~cdef)]
+    `(def ~fname (->GoopFn ~gfn))))
+
+#_(defmacro defgoop [fname args form]
+  (let [gf (gensym (str fname "-goop-") )
+        gfs (name gf)
+        {form :form cdef :cdef} (parallelize form {} "goop-")
+        cdef (or cdef `(go ~form))]
+    `(do
+       (defn ~gf ~args ~cdef)
+       (def ~fname (with-meta
+                     (fn ~args (await-chan `(~gf ~@args)))
+                     {:goop ~gfs})))))
+
+(defmacro goop [form]
+  (let [{form :form cdef :cdef bs :ch-bind} (parallelize form {} "goop-")]
+    (if cdef
+      `(let [~@bs] ~(await-chan cdef))
+      form)))
+
+(defn goop-fn [fs]
+  (let [f (-> fs (as-> s (and symbol? s) (resolve s)) var-get)]
+    (when (instance? GoopFn f) (:gfn f))))
+
+#_(defn goop-fn [f]
   (some-> f (as-> s (and (symbol? s) (resolve s)))
           var-get
           meta
@@ -33,15 +73,6 @@
           symbol
           resolve))
 
-(defn goop-call? [form]
-  (if (list? form)
-    (some-> (first form) (as-> s (and (symbol? s) (resolve s)))
-            var-get meta
-            :goop
-            symbol
-            resolve)))
-
-(declare parallelize parallelize-goop-call parallelize-function-call)
 
 (defn parallelize-goop-call [gf args sym->chan ch-prefix]
   (let [ps   (map #(parallelize % sym->chan "ch-") args)
@@ -64,8 +95,8 @@
         ps   (map #(parallelize % sym->chan "ch-") args)
         bs   (mapcat :ch-bind ps)
         args (map :form ps)
-        par  (some :par ps)]
-    
+        par  (some :par ps)
+        _ (println ps)        ]
     (merge {:sym->chan sym->chan
             :par par
             :ch-bind []}
@@ -78,6 +109,27 @@
                 :cdef cdef
                 :ch-bind [ch cdef]})
              {:form (build-let [`(~f ~@args)] bs)}))))
+
+(defn map-and-deref [g & args] (map (fn [c] (<! c)) (apply map g args)))
+
+(defn parallelize-map [f args sym->chan ch-prefix]
+  (println "parallelize-map" args (type args))
+  (if-let [gf  (goop-fn f)]
+    (parallelize-function-call 'map-and-deref (concat [gf] args) sym->chan ch-prefix)
+    (parallelize-function-call 'map (concat [f] args) sym->chan ch-prefix)))
+
+
+(defn parallelize-fn [[args form] sym->chan ch-prefix]
+  (let [p (parallelize form sym->chan ch-prefix)
+        cdef (:cdef p)]
+    (if cdef
+      {:form `(->GoopFn (fn ~args ~cdef))
+       :par true
+       :sym->chan sym->chan
+       :ch-bind []}
+      {:form `(fn ~args ~form)
+       :par false})))
+
 
 (defn parallelize-let [form sym->chan ch-prefix]
 (let [bs (second form)
@@ -114,9 +166,9 @@
     :cdef      Binding that defines the channel
     :sym->chan Map of user symbols to channel symbols"
   [form sym->chan ch-prefix]
-  (println "parallelize" form (type form) (list? form))
+  (println "parallelize" form)
   (cond
-    (and (list? form) (function? (first form)))
+    (and (list? form) (ifn? (first form)))
     (let [f   (first form)
           gf (goop-fn f)]
       (if gf
@@ -124,6 +176,10 @@
         (parallelize-function-call f (rest form) sym->chan ch-prefix)))
     (and (list? form) (= 'let (first form)))
     (parallelize-let form sym->chan ch-prefix)
+    (and (vector? form) (seq form))
+    (parallelize-function-call 'vector form sym->chan ch-prefix)
+    (list? form)
+    (parallelize-function-call 'seq form sym->chan ch-prefix)
     :else
     {:form (if-let [ch (get sym->chan form)] (await-chan ch) form)
        :sym->chan sym->chan}))
@@ -144,25 +200,6 @@
    (map deref (map (fn [x] (q/promise (fn [] (f x)))) c c2)))
   ([f c1 c2 & cs]
    (map deref (apply map (fn [x1 x2 & xs] (q/promise (fn [] (apply f x1 x2 xs)))) c1 c2 cs))) )
-
-
-(defmacro goop [form]
-  (let [{form :form cdef :cdef bs :ch-bind} (parallelize form {} "goop-")]
-    (if cdef
-      `(let [~@bs] ~(await-chan cdef))
-      form)))
-
-
-(defmacro defgoop [fname args form]
-  (let [gf (gensym (str fname "-goop-") )
-        gfs (name gf)
-        {form :form cdef :cdef} (parallelize form {} "goop-")
-        cdef (or cdef `(go ~form))]
-    `(do
-       (defn ~gf ~args ~cdef)
-       (def ~fname (with-meta
-                     (fn ~args (await-chan `(~gf ~@args)))
-                     {:goop ~gfs})))))
 
 
 
