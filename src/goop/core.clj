@@ -6,15 +6,15 @@
             [clojure.test :refer [function?]]
             [clojure.core.match :refer [match]]
             [clojure.string :as st]
-            [goop.cache :refer (soft-cache-factory)]
+            [clojure.core.cache :refer (soft-cache-factory)]
             ))
 
-(defn- form-to-chan [form] `(a/go ~form))
-;;(defn launch-form [form] `(q/promise (fn [] ~form)))
-(defn- await-chan [ch] `(a/<! ~ch))
+;;(defn- form-to-chan [form] `(a/go ~form))
+(defn form-to-chan [form] `(q/promise (fn [] ~form)))
+;;(defn- await-chan [ch] `(a/<! ~ch))
+(defn await-chan [ch] `(deref ~ch))
 (defmacro <! [ch] (await-chan ch))
 (defmacro go [form] (form-to-chan form))
-;;(defn await-chan [ch] `(deref ~ch))
 
 
 (defn build-let [forms bs]
@@ -25,6 +25,19 @@
         :else
         (first forms))
   )
+
+(def cache (atom (soft-cache-factory {})))
+
+(defn soft-memoize
+  "Same as clojure.core/memoize, but uses a soft cache"
+  {:static true}
+  [f]
+  (fn [& args]
+    (if-let [e (find @cache (conj args f))]
+      (val e)
+      (let [ret (apply f args)]
+        (swap! cache assoc (conj args f) ret)
+        ret))))
 
 
 (declare parallelize parallelize-goop-call parallelize-function-call)
@@ -41,19 +54,9 @@
 (defmacro defgoop [fname args form]
   (let [{form :form cdef :cdef} (parallelize form {} "goop-")
         cdef (or cdef (form-to-chan form))
-        gfn `(fn ~args ~cdef)]
+        gfn `(soft-memoize (fn ~args ~cdef))]
     `(def ~fname (->GoopFn ~gfn))))
 
-#_(defmacro defgoop [fname args form]
-  (let [gf (gensym (str fname "-goop-") )
-        gfs (name gf)
-        {form :form cdef :cdef} (parallelize form {} "goop-")
-        cdef (or cdef `(go ~form))]
-    `(do
-       (defn ~gf ~args ~cdef)
-       (def ~fname (with-meta
-                     (fn ~args (await-chan `(~gf ~@args)))
-                     {:goop ~gfs})))))
 
 (defmacro goop [form]
   (let [{form :form cdef :cdef bs :ch-bind} (parallelize form {} "goop-")]
@@ -62,16 +65,7 @@
       form)))
 
 (defn goop-fn [fs]
-  (let [f (-> fs (as-> s (and symbol? s) (resolve s)) var-get)]
-    (when (instance? GoopFn f) (:gfn f))))
-
-#_(defn goop-fn [f]
-  (some-> f (as-> s (and (symbol? s) (resolve s)))
-          var-get
-          meta
-          :goop
-          symbol
-          resolve))
+  (-> fs (as-> s (and symbol? s) (resolve s)) var-get :gfn))
 
 
 (defn parallelize-goop-call [gf args sym->chan ch-prefix]
@@ -203,81 +197,7 @@
 
 
 
-(def cache (soft-cache-factory {}))
 
-
-
-(comment
-
-  "Currently parallelizing all arguments to all functions.
-Can we parallelize only forms that contain something goopy?
-
-"
-
-  "TODO
-
-
-"
-  
-
-
-  "How should one handle stream operations?
-Return channel containing results?
-Return channel returning channels?
-"
-
-  
-  (def get-promise [f args]
-    (if-let [c (get cache [f args])]
-      c
-      (let [p (promise-chan)]
-        (assoc cache [f args] p)
-        (go (>! p (apply f args)))))))
-
-(def ^:dynamic *goopy* false)
-
-
-
-
-
-(comment
- 
-
-  "
-With goopy bound true, a goop returns a promise channel;
-Otherwise returns value.
-
-
-
-
-")
-
-
-
-
-;; (comment
-
-;;     (symbol? form)
-;;     (or (get ch-bindings form) form)
-
-;;     (= hd 'let) ;; parallelize bindings
-;;             (let [[bdgs & body] args
-;;                   [syms vals] (apply mapv vector (partition 2 bdgs))
-;;                   ch-syms (repeatedly (count syms) #(gensym "c"))
-;;                   ch-bindings (apply assoc ch-bindings (interleave syms ch-syms))
-;;                   goops   (map (fn [a] `(goop ~a ch-bindings)) vals)
-;;                   bdgs  (vec  (interleave ch-syms goops))]
-;;               `(let ~bdgs (goop ~body)))
-
-;;   )
-
-
-
-;; caching
-;; value or hash => promise-chan
-;; close channel on flush from cache
-;;   so fulfillment will need retry logic?  Seems easier than ensuring no active
-;;   listeners
 
 
 
