@@ -1,14 +1,15 @@
-# goop
+# qaxl
 
-A Clojure library designed to ... well, that part is up to you.
+If threads/fibers and promises are cheap, then we can replace an entire AST with
+asynchronous functions, waiting on each other other.
 
 ## Usage
 
-FIXME
+Yeah, well.
 
 ## License
 
-Copyright © 2015 FIXME
+Copyright © 2016 Peter Fraenkel
 
 Distributed under the Eclipse Public License either version 1.0 or (at
 your option) any later version.
