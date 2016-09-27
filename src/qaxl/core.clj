@@ -162,7 +162,7 @@ Sadly, doesn't deal with doc strings and metadata."
         :else                (first forms)))
 
 (defn parallelize-let [[_ bs & forms] s2c]
-  (when (:trace s2c)  (println "paralelize-let" bs forms))
+  (when (:trace s2c)  (println "parallelize-let" bs forms))
   (let [{s2c :s2c bs :bs} (reduce accrue-bindings {:s2c s2c :bs []} (partition 2 bs))
         [ps bsf forms par] (parallelize-forms forms s2c)
         bs (concat bs bsf)]
@@ -180,7 +180,7 @@ Sadly, doesn't deal with doc strings and metadata."
     :s2c       Map of user symbols to channel symbols
   To evaluate, one would apply the bindings and then dereference the channel."
   [form & [s2c]]
-  (when (:trace s2c)  (println "paralelize " form (type form)))
+  (when (:trace s2c)  (println "parallelize " form (type form)))
   (cond
     (nil? s2c)              (parallelize form {})
     (seq? form)
