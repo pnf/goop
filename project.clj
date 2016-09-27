@@ -6,6 +6,7 @@
   :dependencies [[org.clojure/clojure "1.8.0"]
                  [org.clojure/core.cache "0.6.5"]
                  [co.paralleluniverse/pulsar "0.7.6"]
+                 [co.paralleluniverse/comsat-httpkit "0.7.0"]
                  [org.clojure/core.async "0.2.374"]
                  [org.clojure/core.match "0.3.0-alpha4"]
                  ]
