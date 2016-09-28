@@ -8,7 +8,15 @@
             [co.paralleluniverse.pulsar.core :refer [fiber]]
             [clojure.core.match :refer [match]]))
 
-(defn- form-to-chan-m [form] `(q/promise (fn [] ~form)))
+
+(defn- decouple-m [c] (let [c2 (gensym "p")]
+                        `(let [~c2 (q/promise)]
+                           (q/fiber (deliver ~c2 (deref ~c)))
+                           ~c2)))
+(defn- form-to-chan-m [form] (let [c (gensym "p")]
+                               `(let [~c (q/promise)]
+                                  (q/fiber (deliver ~c ~form))
+                                  ~c)))
 (defn- await-chan-m [ch] `(deref ~ch))
 (defn- await-chan!! [ch] (deref ch))
 (defn- deliver-chan-m [ch] `(deliver ~ch))
@@ -18,6 +26,7 @@
 (comment 
   (defmacro gop [form] `(a/pipe (a/go ~form) (a/promise-chan)))
   (defn- form-to-chan-m [form] `(gop ~form))
+  (defn- decouple-m [c] (let [c2 (gensym "p")] `(let [~c2 (a/promise-chan)] (go (>! ~c2 (<! ~c))) )))
   (defn- await-chan-m [ch] `(a/<! ~ch))
   (defn- await-chan!! [ch] (a/<!! ch))
   (defn- deliver-chan-m [ch] `(a/>! ~ch))
@@ -48,8 +57,8 @@
         :else            form))
 
 (defn defer   [{:keys [form bs ch par] :as input}]
-  (cond (= 2 (count bs)) (second bs)
-        ch               `(let [~@bs] ~ch)
+  (cond (= 2 (count bs)) (decouple-m (second bs))
+        ch               (decouple-m `(let [~@bs] ~ch))
         :else            (form-to-chan-m form)))
 
 
@@ -99,7 +108,7 @@ Sadly, doesn't deal with doc strings and metadata."
 
 (defn- std-par [cdef s2c bs]
   (let [ch (gensym "p")]
-    {:ch ch :form (await-chan-m ch) :s2c s2c :par true :bs (concat bs [ch cdef])}))
+    {:ch ch :form (await-chan-m ch) :s2c s2c :par true :bs (concat bs [ch (decouple-m cdef)])}))
 
 (defn- parallelize-if [[_ &  forms] s2c]
   (when (:trace s2c) (println "if" forms))
@@ -190,6 +199,7 @@ Sadly, doesn't deal with doc strings and metadata."
         (res= 'let f)    (parallelize-let form s2c)
         (res= 'map f)    (parallelize-map form s2c)
         (function? f)     (parallelize-func form s2c)
+        (:macro (meta (resolve f))) (parallelize (macroexpand form) s2c)
         :else            (parallelize-special form s2c))
       (parallelize-coll form s2c))
     (coll? form)             (parallelize-coll form s2c)
