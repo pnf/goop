@@ -1,6 +1,6 @@
 (ns qaxl.core
   (:use clojure.walk clojure.pprint qaxl.cache)
-  (:require ;[co.paralleluniverse.pulsar.async :as qa]
+  (:require [co.paralleluniverse.pulsar.async :as qa]
             [clojure.core.async :as a]
             [co.paralleluniverse.pulsar.core :as q]
             [clojure.test :refer [function?]]
@@ -23,97 +23,119 @@
         (and ra rb (= (resolve a) (resolve b))))))
 
 ;; If there's a channel that will return the value of this symbol, substitute its deref.
-(defn- parallelize-subst [s s2c]
+(defn- parallelize-subst [s s2p]
   (if (symbol? s)
-    (if (contains? s2c s)
-      {:form `(deref ~(get s2c s)) :s2c s2c :par true}
-      {:form s :susp (some-> s resolve var-get q/suspendable?) :s2c s2c})
-    {:form s :s2c s2c}))
-
-(defn- parallelize-forms [forms s2c] (map #(parallelize % s2c) forms))
-
-(defn- par-to-bindings [ps] ;; => [bs args]
-  (let [[bs args]
-        (reduce
-         (fn [[bs args] p]
-           (if (:par p)
-             (let [ch (gensym "p")]
-               [(concat bs [ch `(q/promise (fn [] ~(:form p)))])
-                (conj args `(deref ~ch))])
-             [bs (conj args (:form p))]))
-         [[] []]
-         ps)]
-    [bs (seq args)]))
+    (if (contains? s2p s)
+      {:form `(deref ~(get s2p s)) :s2p s2p :par true}
+      {:form s :par (some-> s resolve var-get q/suspendable?) :s2p s2p})
+    {:form s :s2p s2p}))
 
 
-(defn- parallelize-func [forms s2c]
-  (when (:trace s2c) (println "parallelize-func" forms))
-  (let [ps         (parallelize-forms forms s2c)
-        [bs forms] (par-to-bindings ps)
-        par        (or (some :par ps) (:susp (first ps)))]
-    {:form (if (seq bs) `(let [~@bs] (~@forms)) `(~@forms)) :par par :s2c s2c}))
+(defn- parallelize-forms [forms s2p] (map #(parallelize % s2p) forms))
+(defn- par-to-bindings [forms s2p] ;; => [bs args]
+  (let [ps  (parallelize-forms)
+        [bs args] (reduce (fn [[bs args] p]
+                            (if (:par p)
+                              (let [ch (gensym "p")]
+                                [(concat bs [ch `(q/promise (fn [] ~(:form p)))])
+                                 (conj args `(deref ~ch))])
+                              [bs (conj args (:form p))]))
+                          [[] []]
+                          ps)]
+    [ps bs (seq args)]))
+
+
+(defn- parallelize-func [forms s2p]
+  (when (:trace s2p) (println "parallelize-func" forms))
+  (let [[ps bs forms] (par-to-bindings forms s2p)
+        par        (some :par ps)]
+    {:form (if (seq bs) `(let [~@bs] (~@forms)) `(~@forms)) :par par :s2p s2p}))
 
 ;; Possibly lazy
-(defn- parallelize-special [[s & forms] s2c]
-  (when (:trace s2c) (println "parallelize-special" s forms))
-  (let [ps (parallelize-forms forms s2c)]
-    {:form `(~s ~@(map :form ps)) :par (some :par ps) :s2c s2c}))
+(defn- parallelize-special [[s & forms] s2p]
+  (when (:trace s2p) (println "parallelize-special" s forms))
+  (let [ps (parallelize-forms forms s2p)]
+    {:form `(~s ~@(map :form ps)) :par (some :par ps) :s2p s2p}))
 
-(defn- parallelize-coll [form s2c]
-  (let [ps  (parallelize-forms (seq form) s2c)
-        [bs forms] (par-to-bindings ps)]
+(defn- parallelize-coll [form s2p]
+  (let [[ps bs forms] (par-to-bindings (seq form) s2p)]
     {:form (if (seq bs) `(let [~@bs] ~(into (empty form) forms)) form)
-     :par (some :par ps) :s2c s2c}))
+     :par (some :par ps) :s2p s2p}))
 
 
-(defn- parallelize-map [[_ & forms] s2c]
-  (when (:trace s2c) (println "parallelize-map" forms))
-  (let [ps   (parallelize-forms forms s2c)
-        [bs [f & args]] (par-to-bindings ps)
-        m1  (if (or (:par (first ps)) (:susp (first ps)))
-              `(map deref (map (fn [& xs#] (q/promise (fn [] (apply ~f xs#)))) ~@args ))
+(defn- parallelize-map [[_ & forms] s2p]
+  (when (:trace s2p) (println "parallelize-map" forms))
+  (let [[ps bs [f & args]] (par-to-bindings forms s2p)
+        m1  (if (:par (first ps))
+              `(map deref (doall (map (fn [& xs#] (q/promise (fn [] (apply ~f xs#)))) ~@args )))
               `(map ~f ~@args))]
-    {:form (if (seq bs) `(let [~@bs] ~m1) m1) :par (or (some :par ps) (:susp (first ps)))}))
+    {:form (if (seq bs) `(let [~@bs] ~m1) m1) :par (some :par ps)}))
 
 
-(defn parallelize-let [[_ bs & forms] s2c]
-  (when (:trace s2c)  (println "parallelize-let" bs forms))
+#_(defn parallelize-let [[_ bs & forms] s2p]
+  (when (:trace s2p)  (println "parallelize-let" bs forms))
   (let [[bs1 bs2] (reduce
                    (fn [[bs1 bs2] [s form]]
-                     (let [{:keys [form par]} (parallelize form s2c)]
+                     (let [{:keys [form par]} (parallelize form s2p)]
                        (if par
                          (let [ch (gensym "p")]
                            [(concat bs1 [ch `(q/promise (fn [] ~form))])
                             (concat bs2  [s `(deref ~ch)])])
-                         [bs1 (concat bs2 [s form])])))
+                         [bs1 (concat bs2 [s form])] )))
                    [[] []]
                    (partition 2 bs))
-        ps  (parallelize-forms forms s2c)]
+        ps  (parallelize-forms forms s2p)]
+    {:form `(let [~@(concat bs1 bs2)] ~@(map :form ps)) :par (or (seq bs1) (some :par ps))}))
+
+(defn parallelize-let [[_ bs & forms] s2p]
+  (when (:trace s2p)  (println "parallelize-let" bs forms))
+  (let [[bs1 bs2] (reduce
+                   (fn [[bs1 bs2 s2p] [s form]]
+                     (let [{:keys [form par]} (parallelize form s2p)]
+                       (if par
+                         (let [ch (gensym "p")]
+                           [(concat bs1 [ch `(q/promise (fn [] ~form))])
+                            (concat bs2  [s `(deref ~ch)])
+                            (assoc s2p s ch)])
+                         [bs1 (concat bs2 [s form]) s2p])))
+                   [[] [] s2p]
+                   (partition 2 bs))
+        ps  (parallelize-forms forms s2p)]
     {:form `(let [~@(concat bs1 bs2)] ~@(map :form ps)) :par (or (seq bs1) (some :par ps))}))
 
 
 (defn parallelize
   "Parallelize a form, returning map:
     :form      Parallelized form that can be substituted.
-    :bs        Bindings that defines the channel
-    :ch        Channel to be dereferenced
     :par       parallel?
-    :s2c       Map of user symbols to channel symbols
+    :s2p       Map of user symbols to channel symbols
   To evaluate, one would apply the bindings and then dereference the channel."
-  [form & [s2c]]
-  (when (:trace s2c)  (println "parallelize " form (type form)))
+  [form & [s2p]]
+  (when (:trace s2p)  (println "parallelize " form (type form)))
   (cond
-    (nil? s2c)              (parallelize form {})
+    (nil? s2p)              (parallelize form {})
     (seq? form)
     (if-let [f (as-> (first form) f (when (symbol? f) f))] 
       (cond
-        (res= 'let f)    (parallelize-let form s2c)
-        (res= 'map f)    (parallelize-map form s2c)
-        (function? f)     (parallelize-func form s2c)
-        (:macro (meta (resolve f))) (parallelize (macroexpand form) s2c)
-        :else            (parallelize-special form s2c))
-      (parallelize-coll form s2c))
-    (coll? form)             (parallelize-coll form s2c)
-    :else                    (parallelize-subst form s2c)))
+        (res= 'let f)    (parallelize-let form s2p)
+        (res= 'map f)    (parallelize-map form s2p)
+        (function? f)     (parallelize-func form s2p)
+        (:macro (meta (resolve f))) (parallelize (macroexpand form) s2p)
+        :else            (parallelize-special form s2p))
+      (parallelize-coll form s2p))
+    (coll? form)             (parallelize-coll form s2p)
+    :else                    (parallelize-subst form s2p)))
 
+(defmacro parallelize-func-stupid [form]
+  (let [[f & args] form
+        cs   (repeat (count args) (gensym))
+        bs   (interleave cs (map (fn [arg] `(a/go ~arg)) args))
+        args (map (fn [c] `(a/<! ~c)) cs)]
+    `(let [~@bs] (~f ~@args))))
 
+(defmacro parallelize-func-stupid2 [form]
+  (let [[f & args] form
+        ps   (repeat (count args) (gensym))
+        bs   (interleave ps (map (fn [arg] `(q/promise (fn [] ~arg))) args))
+        args (map (fn [p] `(deref ~p)) ps)]
+    `(let [~@bs] (~f ~@args))))
