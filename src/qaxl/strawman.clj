@@ -20,13 +20,13 @@
     (if (instance? Result coll) coll
         (let [coll (map try-get coll)
               bs   (filter #(instance? Result %) coll)]
-          (if (seq bs) (->Result (atom [:deps bs]))
+          (if (seq bs) (->Result (volatile! [:deps bs]))
               (try-get (f coll)))))))
 
 (defn block-apply [f & args] (try-coll args #(apply f %)))
 (defn block-map [f coll] (try-coll (try-coll coll #(map f %)) identity))
 
-(def query (memoize (fn [& q] (->Result (atom [:query q])))))
+(def query (memoize (fn [& q] (->Result (volatile! [:query q])))))
 
 (defn reap [b]
   (if-not (instance? Result b) []
@@ -35,7 +35,7 @@
                  [[:deps rs]] (mapcat reap rs)
                  :else [])))
 
-(defn fulfill [r v] (reset! (.a r) [:value v]) r)
+(defn fulfill [r v] (vreset! (.a r) [:value v]) r)
 
 (defn getFirstName [id] (query "select firstName from stuff where id=" id))
 (defn getLastName [id] (query "select lastName from stuff where id=" id))

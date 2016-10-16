@@ -33,7 +33,7 @@
 
 (defn- parallelize-forms [forms s2p] (map #(parallelize % s2p) forms))
 (defn- par-to-bindings [forms s2p] ;; => [bs args]
-  (let [ps  (parallelize-forms)
+  (let [ps  (parallelize-forms forms s2p)
         [bs args] (reduce (fn [[bs args] p]
                             (if (:par p)
                               (let [ch (gensym "p")]
