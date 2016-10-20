@@ -11,4 +11,7 @@
                  [org.clojure/core.match "0.3.0-alpha4"]
                  ]
   :java-agents [[co.paralleluniverse/quasar-core "0.7.6"]]
+  :repl-options {:timeout 120000
+                 }
+
   )

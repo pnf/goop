@@ -66,26 +66,14 @@
 (defn- parallelize-map [[_ & forms] s2p]
   (when (:trace s2p) (println "parallelize-map" forms))
   (let [[ps bs [f & args]] (par-to-bindings forms s2p)
-        m1  (if (:par (first ps))
-              `(map deref (doall (map (fn [& xs#] (q/promise (fn [] (apply ~f xs#)))) ~@args )))
-              `(map ~f ~@args))]
+        m1  (if-not (:par (first ps))
+              `(map ~f ~@args)
+              `(map deref
+                    (doall (map (fn [& xs#]
+                                  (q/promise (fn [] (apply ~f xs#))))
+                                ~@args ))))]
     {:form (if (seq bs) `(let [~@bs] ~m1) m1) :par (some :par ps)}))
 
-
-#_(defn parallelize-let [[_ bs & forms] s2p]
-  (when (:trace s2p)  (println "parallelize-let" bs forms))
-  (let [[bs1 bs2] (reduce
-                   (fn [[bs1 bs2] [s form]]
-                     (let [{:keys [form par]} (parallelize form s2p)]
-                       (if par
-                         (let [ch (gensym "p")]
-                           [(concat bs1 [ch `(q/promise (fn [] ~form))])
-                            (concat bs2  [s `(deref ~ch)])])
-                         [bs1 (concat bs2 [s form])] )))
-                   [[] []]
-                   (partition 2 bs))
-        ps  (parallelize-forms forms s2p)]
-    {:form `(let [~@(concat bs1 bs2)] ~@(map :form ps)) :par (or (seq bs1) (some :par ps))}))
 
 (defn parallelize-let [[_ bs & forms] s2p]
   (when (:trace s2p)  (println "parallelize-let" bs forms))
@@ -127,15 +115,20 @@
     :else                    (parallelize-subst form s2p)))
 
 (defmacro parallelize-func-stupid [form]
+  ;; Extract the function and its arguments,
   (let [[f & args] form
-        cs   (repeat (count args) (gensym))
+        ;; make a bunch of channels
+        cs   (repeatedly (count args) gensym)
+        ;; create binding form arguments to match them with the
+        ;; arguments, now launched in their own go blocks.
         bs   (interleave cs (map (fn [arg] `(a/go ~arg)) args))
+        ;; Now we just pull out the results:
         args (map (fn [c] `(a/<! ~c)) cs)]
     `(let [~@bs] (~f ~@args))))
 
 (defmacro parallelize-func-stupid2 [form]
   (let [[f & args] form
-        ps   (repeat (count args) (gensym))
+        ps   (repeatedly (count args) gensym)
         bs   (interleave ps (map (fn [arg] `(q/promise (fn [] ~arg))) args))
         args (map (fn [p] `(deref ~p)) ps)]
     `(let [~@bs] (~f ~@args))))
